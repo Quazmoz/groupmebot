@@ -33,16 +33,25 @@ BOT_ID = os.environ.get('GROUPME_BOT_ID')
 GROUP_ID = os.environ.get('GROUPME_GROUP_ID')
 ACCESS_TOKEN = os.environ.get('GROUPME_ACCESS_TOKEN') # Needed to fetch group members
 
+# New: Blacklist configuration
+# Expects a comma-separated string of GroupMe User IDs
+BLACKLISTED_USER_IDS_STR = os.environ.get('GROUPME_BLACKLIST_USER_IDS', '') # Default to empty string
+BLACKLISTED_USER_IDS = set(BLACKLISTED_USER_IDS_STR.split(',')) if BLACKLISTED_USER_IDS_STR else set()
+
 # GroupMe API Base URL
 GROUPME_API_URL = 'https://api.groupme.com/v3'
 
-# --- Configuration Validation ---
+# --- Configuration Validation & Logging ---
 if not BOT_ID:
     logging.warning("Environment variable GROUPME_BOT_ID is not set.")
 if not GROUP_ID:
     logging.warning("Environment variable GROUPME_GROUP_ID is not set.")
 if not ACCESS_TOKEN:
     logging.warning("Environment variable GROUPME_ACCESS_TOKEN is not set. Member fetching will fail.")
+if BLACKLISTED_USER_IDS:
+    logging.info(f"Blacklisted User IDs loaded: {BLACKLISTED_USER_IDS}")
+else:
+    logging.info("No blacklisted User IDs configured or found.")
 
 # ==============================================================================
 #                           Helper Functions
@@ -65,14 +74,14 @@ def get_group_members():
     logging.info(f"Attempting to fetch group members from GroupMe API for group ID: {GROUP_ID}")
 
     try:
-        response = requests.get(url, timeout=15) # Increased timeout slightly
+        response = requests.get(url, timeout=15)
         logging.info(f"Group members fetch response status: {response.status_code}")
         response.raise_for_status()
         group_info = response.json()
         members = group_info.get('response', {}).get('members', [])
-        logging.info(f"Successfully fetched {len(members)} members.")
-        if members: # Log first few members for verification if needed, but be mindful of PII
-            logging.debug(f"First few members (debug): {json.dumps(members[:2], indent=2)}")
+        logging.info(f"Successfully fetched {len(members)} members raw from API.")
+        if members:
+            logging.debug(f"First few members (debug, raw): {json.dumps(members[:2], indent=2)}")
         return members
     except requests.exceptions.Timeout:
         logging.error("Error fetching group members: Request timed out.")
@@ -110,17 +119,16 @@ def send_bot_message(text, attachments=None):
         payload['attachments'] = attachments
 
     logging.info(f"Attempting to send message. Bot ID: {BOT_ID}, URL: {url}")
-    logging.info(f"Payload being sent to GroupMe: {json.dumps(payload)}") # Log the exact payload
+    logging.info(f"Payload being sent to GroupMe: {json.dumps(payload)}")
 
     try:
-        response = requests.post(url, json=payload, timeout=15) # Increased timeout
-        # Log the full response details, regardless of status code, for better debugging
+        response = requests.post(url, json=payload, timeout=15)
         logging.info(
             f"GroupMe API response. Status: {response.status_code}, "
             f"Headers: {response.headers}, Body: {response.text}"
         )
 
-        if 200 <= response.status_code < 300: # Typically 202 Accepted
+        if 200 <= response.status_code < 300:
             logging.info(f"Successfully sent message (received {response.status_code}). Text: '{text[:70]}...'")
             return True
         else:
@@ -144,7 +152,7 @@ def send_bot_message(text, attachments=None):
 def webhook():
     """
     Handles incoming POST requests from GroupMe.
-    Checks for '@all' command and triggers mentions if found.
+    Checks for '@all' command and triggers mentions if found, respecting blacklist.
     """
     try:
         data = request.get_json()
@@ -154,115 +162,72 @@ def webhook():
             logging.warning("Webhook received empty data.")
             return Response(status=204)
 
-        if data.get('sender_type') == 'bot': # Important: check sender_type, not name
+        if data.get('sender_type') == 'bot':
             logging.info(f"Ignoring message from bot (sender_type: 'bot', name: {data.get('name')}).")
             return Response(status=200)
 
         message_text = data.get('text', '').strip()
         sender_name = data.get('name', 'Someone')
-        sender_id = data.get('sender_id') # User ID of the person who sent the message
+        sender_id = data.get('sender_id')
 
-        if '@all' in message_text.lower(): # Case-insensitive check
+        if '@all' in message_text.lower():
             logging.info(f"Detected '@all' command from {sender_name} (User ID: {sender_id}). Message: '{message_text}'")
 
             if not BOT_ID or not GROUP_ID or not ACCESS_TOKEN:
                 logging.error("Bot is not fully configured (BOT_ID, GROUP_ID, or ACCESS_TOKEN missing). Cannot process @all.")
-                # Optionally send a message back if BOT_ID is available
                 if BOT_ID:
                     send_bot_message(f"Sorry @{sender_name}, I'm not fully configured to handle @all right now.")
                 return Response("Bot configuration incomplete", status=500)
 
-            members = get_group_members()
-            if not members:
+            all_members = get_group_members()
+            if not all_members:
                 logging.error("Failed to get group members. Cannot proceed with @all.")
                 send_bot_message(f"Sorry @{sender_name}, I couldn't fetch group members for the @all command.")
                 return Response("Failed to fetch group members", status=500)
 
-            mention_intro = f"@{sender_name} summoned everyone!\n"
-            user_ids_to_mention = []
-            loci_data = []
-            
-            # Text construction: Intro + space-separated @Nicknames
-            current_text_parts = [mention_intro.strip()] # Start with the intro
-
-            for member in members:
-                # Optional: Avoid mentioning the bot itself if it appears in member list
-                # (though GroupMe usually handles this)
-                # if member['user_id'] == BOT_USER_ID: # BOT_USER_ID would be bot's actual user ID, not BOT_ID
-                #    continue
-
+            # Filter members based on the blacklist
+            members_to_mention = []
+            for member in all_members:
+                if member.get('user_id') in BLACKLISTED_USER_IDS:
+                    logging.info(f"User {member.get('nickname')} (ID: {member.get('user_id')}) is blacklisted. Skipping.")
+                    continue
                 # Optional: Avoid self-mentioning the sender of '@all' if desired
-                # if member['user_id'] == sender_id:
+                # if member.get('user_id') == sender_id:
+                #    logging.info(f"Skipping sender {sender_name} from @all mention as per configuration (optional).")
                 #    continue
-
-                nickname_mention = f"@{member['nickname']}"
-                current_text_parts.append(nickname_mention)
-                user_ids_to_mention.append(member['user_id'])
-
-            # Combine all text parts to form the final message text
-            final_message_text = " ".join(current_text_parts)
+                members_to_mention.append(member)
             
-            # Calculate loci based on the final_message_text
-            # The first mention starts after the intro phrase and a space
-            current_pos = len(mention_intro) # Start after the intro line (includes its trailing space if any)
-                                            # If intro is "User summoned!\n", next mention is after that.
+            logging.info(f"Total members fetched: {len(all_members)}. Members to mention after blacklist: {len(members_to_mention)}.")
 
-            # Re-iterate to build loci based on the *final* text structure
-            # Start from the first actual @Nickname, which is after the intro.
-            # The intro itself is not a "mention" in the attachment.
-            temp_text_for_loci_calc = mention_intro 
-            for member in members: # Assuming same order as user_ids_to_mention
-                # This part needs to be precise: loci are for @nickname in the *final* text
-                nickname_to_find = f"@{member['nickname']}"
-                
-                # Find the start of this specific nickname_mention in the *final_message_text*
-                # starting from *after* the intro part.
-                # This is tricky if nicknames are substrings of each other.
-                # A more robust way is to build loci as we build the string.
-                
-                # Let's rebuild loci more carefully:
-                # loci_data is already being built below, let's refine that loop.
-                pass # Placeholder, main loci logic is below.
+            if not members_to_mention:
+                logging.info("No users to mention after filtering (empty group or all members blacklisted/filtered).")
+                send_bot_message(f"@{sender_name}, there was no one to mention with @all after applying filters.")
+                return Response(status=200)
 
+            mention_intro = f"Message from: @{sender_name} to all\n"
+            
             # Refined Loci Calculation:
-            # Iterate through the constructed text parts to build loci accurately.
-            # The `mention_intro` is the prefix. Mentions start after it.
-            running_offset = len(mention_intro) # Start of the first actual mention part
+            running_offset = len(mention_intro) 
             
-            # Clear and rebuild loci_data
-            loci_data = []
-            processed_user_ids = [] # To match with user_ids_to_mention if filtering applied
+            final_mention_text_parts = [mention_intro.strip()] # Start with the intro, no leading/trailing whitespace for this part
+            processed_user_ids_for_attachment = []
+            loci_data_for_attachment = []
 
-            # Iterate through members again to build loci based on the final text structure
-            temp_mention_text_parts = []
-            for member in members:
-                # Apply same filtering as above if any (e.g. skip sender, skip bot)
-                # For now, assuming all members fetched are mentioned
-                
+            for member in members_to_mention:
                 nickname_mention_str = f"@{member['nickname']}"
-                temp_mention_text_parts.append(nickname_mention_str) # For joining later
+                final_mention_text_parts.append(nickname_mention_str)
 
-                # Loci: [start_index_in_final_string, length_of_this_mention_string]
-                # The start_index is relative to the beginning of `final_message_text`
-                loci_data.append([running_offset, len(nickname_mention_str)])
-                processed_user_ids.append(member['user_id']) # ensure this matches user_ids_to_mention
+                loci_data_for_attachment.append([running_offset, len(nickname_mention_str)])
+                processed_user_ids_for_attachment.append(member['user_id'])
 
-                # Update running_offset for the next mention: length of current + 1 for the space
-                running_offset += len(nickname_mention_str) + 1
+                running_offset += len(nickname_mention_str) + 1 # +1 for the space
             
-            # Construct the final text by joining the intro and the nickname parts
-            final_message_text = mention_intro + " ".join(temp_mention_text_parts)
-
-
-            if not processed_user_ids:
-                logging.info("No users to mention after filtering (or empty group).")
-                # send_bot_message(f"@{sender_name}, there was no one to mention with @all.")
-                return Response(status=200) # Or handle as an error if preferred
+            final_message_text = " ".join(final_mention_text_parts) # Join intro and all @nickname parts
 
             mention_attachment = {
                 "type": "mentions",
-                "user_ids": processed_user_ids, # Use the list of user_ids that correspond to the loci
-                "loci": loci_data
+                "user_ids": processed_user_ids_for_attachment,
+                "loci": loci_data_for_attachment
             }
 
             logging.info(f"Final mention text (first 150 chars): {final_message_text[:150]}...")
@@ -270,8 +235,6 @@ def webhook():
 
             if not send_bot_message(final_message_text, [mention_attachment]):
                 logging.error("send_bot_message returned False. The @all message might not have been delivered.")
-                # Potentially send a simpler message to the user if this fails
-                # send_bot_message(f"@{sender_name}, I tried to send the @all but encountered an issue.")
                 return Response("Failed to send mention message via bot", status=500)
             else:
                 logging.info("send_bot_message returned True. GroupMe API likely accepted the @all message.")
@@ -281,7 +244,7 @@ def webhook():
 
     except Exception as e:
         logging.error(f"An unexpected error occurred in webhook: {e}")
-        logging.error(traceback.format_exc()) # Log full traceback
+        logging.error(traceback.format_exc())
         return Response("Internal server error during webhook processing", status=500)
 
     return Response(status=200)
@@ -298,10 +261,15 @@ def health_check():
 
     if issues:
         status_message += " WARNING: Configuration issues detected: " + ", ".join(issues)
-        return status_message, 200 # Still 200, but with warning
     else:
         status_message += " All essential configurations seem present."
-        return status_message, 200
+    
+    if BLACKLISTED_USER_IDS_STR:
+        status_message += f" Blacklist is configured with {len(BLACKLISTED_USER_IDS)} ID(s)."
+    else:
+        status_message += " No blacklist configured."
+
+    return status_message, 200
 
 # ==============================================================================
 #                           Main Execution Block
@@ -309,7 +277,5 @@ def health_check():
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8000))
     logging.info(f"Starting Flask development server on host 0.0.0.0 port {port}")
-    # Use debug=False for production-like testing, True for active development
-    # Azure App Service will use Gunicorn specified in the Startup Command, not this.
     app.run(host='0.0.0.0', port=port, debug=False)
 
