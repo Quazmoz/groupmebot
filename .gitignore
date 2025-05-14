@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.env
+*.envhttps://portal.azure.com/#@flyingpork15gmail.onmicrosoft.com/resource/subscriptions/5e5b6b9b-fbdf-4418-917d-f15712dc4618/resourceGroups/groupmebot/providers/Microsoft.Web/sites/GroupMeBot/environmentVariablesAppSettings

@@ -1,0 +1,5 @@
+Flask>=2.0 # Web framework
+requests>=2.25 # For making HTTP requests
+# Gunicorn is typically provided by the Azure environment or installed via startup command,
+# but you can include it here if you prefer explicit dependency management.
+# gunicorn>=20.0
